@@ -1,0 +1,12 @@
+{
+  "job_state": "success",
+  "started_at": "2026-05-18T17:18:10.064957+00:00",
+  "finished_at": "2026-05-18T17:18:16.734108+00:00",
+  "message": "Indexing completed successfully.",
+  "error_detail": null,
+  "document_count": 4,
+  "chunk_count": 20,
+  "vector_count": 20,
+  "vector_store_provider": "local_json",
+  "embedding_provider": "openai"
+}

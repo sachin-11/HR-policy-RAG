@@ -1,0 +1,70 @@
+services:
+  - type: web
+    name: hr-policy-assistant-api
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    region: oregon
+    plan: free
+
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: APP_DEBUG
+        value: false
+      - key: API_V1_PREFIX
+        value: /api/v1
+
+      # Set these in the Render dashboard — do NOT hardcode real values here
+      - key: OPENAI_API_KEY
+        sync: false                  # Render will prompt you to enter this
+
+      - key: FRONTEND_ORIGIN
+        sync: false                  # Your Vercel URL: https://your-app.vercel.app
+
+      - key: JWT_SECRET_KEY
+        generateValue: true          # Render auto-generates a secure random value
+
+      - key: ADMIN_PASSWORD
+        sync: false                  # Set a strong password in Render dashboard
+
+      - key: LLM_PROVIDER
+        value: openai
+
+      - key: OPENAI_CHAT_MODEL
+        value: gpt-4o-mini
+
+      - key: OPENAI_EMBEDDING_MODEL
+        value: text-embedding-3-small
+
+      - key: VECTOR_STORE_PROVIDER
+        value: local_json            # Change to "pinecone" for persistent production
+
+      - key: RAW_DOCS_DIR
+        value: ./data/raw_docs
+
+      - key: VECTOR_STORE_DIR
+        value: ./data/processed/vector_store
+
+      - key: LOG_LEVEL
+        value: INFO
+
+      # Uncomment and fill when switching to Pinecone:
+      # - key: PINECONE_API_KEY
+      #   sync: false
+      # - key: PINECONE_INDEX_NAME
+      #   value: hr-policy-assistant
+      # - key: PINECONE_NAMESPACE
+      #   value: production
+      # - key: PINECONE_CLOUD
+      #   value: aws
+      # - key: PINECONE_REGION
+      #   value: us-east-1
+
+      # Uncomment for email features:
+      # - key: SMTP_USER
+      #   sync: false
+      # - key: SMTP_PASS
+      #   sync: false
+      # - key: HR_CONTACT_EMAIL
+      #   value: hr@yourcompany.com

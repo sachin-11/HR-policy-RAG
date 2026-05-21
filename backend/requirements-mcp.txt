@@ -1,0 +1,8 @@
+# MCP (Model Context Protocol) server dependencies
+# Install AFTER requirements.txt to avoid starlette conflict:
+#
+#   pip install -r requirements.txt
+#   pip install -r requirements-mcp.txt
+#   pip install "starlette>=0.40.0,<0.42.0"   # re-pin for FastAPI
+
+mcp[cli]==1.27.1

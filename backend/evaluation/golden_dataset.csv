@@ -1,0 +1,6 @@
+id,user_message,expected_answer_term,expected_source,should_refuse,expected_tool_action,expected_approval_required
+policy_1,What is the sick leave policy in India?,inform their manager,hr_leave_policy_india_2026.md,False,,False
+ticket_1,Create a ticket for reimbursement support.,reimbursement, ,False,hr_ticket/create,True
+email_1,Send an email to my manager requesting a leave.,manager, ,False,email_draft/send,True
+policy_2,How do I request reimbursement for a laptop accessory?,invoice,reimbursement_policy.txt,False,,False
+no_context_1,Does the company allow free snacks on Thursday?,could not find, ,True,,False

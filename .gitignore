@@ -1,0 +1,32 @@
+# ── Secrets — NEVER commit these ──────────────────────────────────────────────
+.env
+.env.local
+.env.production
+.env.production.local
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.ruff_cache/
+
+# ── Vector store & processed data (large binary files) ────────────────────────
+# Remove this line if you want to bundle the vector store in your Docker image
+# backend/data/processed/
+
+# ── Node / Next.js ────────────────────────────────────────────────────────────
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.env.local
+frontend/.env.production.local
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
