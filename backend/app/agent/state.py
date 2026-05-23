@@ -37,6 +37,17 @@ class AgentState(TypedDict, total=False):
     search_query: str  # rewritten query used for vector search (may differ from user_message)
     retry_count: int   # number of retrieval retries attempted so far
 
+    # ── react loop ─────────────────────────────────────────────────────────
+    react_iterations: int    # how many ReAct observe-decide cycles have run
+    react_decision: str      # last decision: done / escalate / search_policy / retry
+
+    # ── multi-agent routing ─────────────────────────────────────────────────
+    specialist: str           # name of the routed specialist (e.g. 'leave_agent')
+    specialist_system_prompt: str  # injected into RAG prompt for this specialist
+
+    # ── semantic cache ──────────────────────────────────────────────────────
+    cache_hit: bool           # True when answer was served from semantic cache
+
     # ── accumulated lists (reducer = append, not replace) ──────────────────
     tool_results: Annotated[list[dict[str, Any]], operator.add]
     approval_required_actions: Annotated[list[dict[str, Any]], operator.add]

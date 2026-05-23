@@ -1,0 +1,12 @@
+{
+  "user_id": "",
+  "preferences": {},
+  "interactions": [
+    {
+      "ts": "2026-05-23T07:49:02.882170+00:00",
+      "action": "email_sent",
+      "summary": "Sent email to rajeshsachin786@gmail.com",
+      "recipient": "rajeshsachin786@gmail.com"
+    }
+  ]
+}

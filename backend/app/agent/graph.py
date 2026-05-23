@@ -59,12 +59,16 @@ from app.agent.llm import LLMClient
 from app.agent.nodes import (
     MAX_RETRIEVAL_RETRIES,
     build_initial_state,
+    cache_store_node,
     classify_intent_node,
     execute_tools_node,
     generate_answer_node,
     grade_documents_node,
+    llm_tool_calling_node,
+    react_loop_node,
     retrieve_context_node,
     rewrite_query_node,
+    supervisor_node,
     validate_response_node,
 )
 from app.agent.state import AgentState
@@ -232,10 +236,15 @@ class HRPolicyAgent:
 
         workflow = StateGraph(AgentState)
 
-        workflow.add_node("classify_intent", classify_intent_node)
+        # supervisor routes to specialist sub-agent
         workflow.add_node(
-            "execute_tools",
-            lambda s: execute_tools_node(s, self.tool_orchestrator),
+            "supervisor",
+            lambda s: supervisor_node(s, self.llm_client),
+        )
+        # llm_tool_calling replaces classify_intent + execute_tools in one node
+        workflow.add_node(
+            "llm_tool_calling",
+            lambda s: llm_tool_calling_node(s, self.llm_client),
         )
         workflow.add_node(
             "rewrite_query",
@@ -254,23 +263,19 @@ class HRPolicyAgent:
             lambda s: generate_answer_node(s, self.llm_client),
         )
         workflow.add_node("validate_response", validate_response_node)
-
-        workflow.set_entry_point("classify_intent")
-
-        # Conditional: action_request → execute_tools; else → rewrite_query
-        workflow.add_conditional_edges(
-            "classify_intent",
-            _route_after_classify,
-            {
-                "execute_tools": "execute_tools",
-                "rewrite_query": "rewrite_query",
-            },
+        workflow.add_node(
+            "cache_store",
+            lambda s: cache_store_node(s, self.retriever),
+        )
+        workflow.add_node(
+            "react_loop",
+            lambda s: react_loop_node(s, self.llm_client),
         )
 
-        workflow.add_edge("execute_tools", "rewrite_query")
-        workflow.add_edge("rewrite_query", "retrieve_context")
-        workflow.add_edge("retrieve_context", "grade_documents")
-
+        workflow.set_entry_point("supervisor")
+        workflow.add_edge("supervisor", "llm_tool_calling")
+        workflow.add_edge("llm_tool_calling", "react_loop")
+        workflow.add_edge("react_loop", "rewrite_query")
         # Conditional: no relevant docs → loop back to rewrite_query; else → generate
         workflow.add_conditional_edges(
             "grade_documents",
@@ -282,7 +287,8 @@ class HRPolicyAgent:
         )
 
         workflow.add_edge("generate_answer", "validate_response")
-        workflow.add_edge("validate_response", END)
+        workflow.add_edge("validate_response", "cache_store")
+        workflow.add_edge("cache_store", END)
 
         checkpointer = MemorySaver()
         return workflow.compile(checkpointer=checkpointer)
@@ -292,10 +298,14 @@ class HRPolicyAgent:
     def _run_plain_python(self, state: AgentState) -> AgentState:
         """Sequential node pipeline with agentic retry loop."""
 
-        state = _merge(state, classify_intent_node(state))
+        # Supervisor routes to specialist
+        state = _merge(state, supervisor_node(state, self.llm_client))
 
-        if state.get("intent") == "action_request":
-            state = _merge(state, execute_tools_node(state, self.tool_orchestrator))
+        # LLM tool calling replaces keyword classify + execute_tools
+        state = _merge(state, llm_tool_calling_node(state, self.llm_client))
+
+        # ReAct: observe tool results, reason, decide next step
+        state = _merge(state, react_loop_node(state, self.llm_client))
 
         # Agentic RAG: rewrite → retrieve → grade, retry up to MAX_RETRIEVAL_RETRIES times
         for _ in range(1 + MAX_RETRIEVAL_RETRIES):
@@ -306,7 +316,8 @@ class HRPolicyAgent:
                 break  # relevant docs found — proceed to generation
 
         state = _merge(state, generate_answer_node(state, self.llm_client))
-        return _merge(state, validate_response_node(state))
+        state = _merge(state, validate_response_node(state))
+        return _merge(state, cache_store_node(state, self.retriever))
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────

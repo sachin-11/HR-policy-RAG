@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from app.agent.email_compose import compose_leave_email
+from app.agent.email_compose import compose_custom_email, compose_leave_email
 from app.agent.llm import LLMClient
 from app.config import get_settings
 from app.mail.smtp_client import send_plain_text_email, smtp_is_configured
@@ -19,7 +19,15 @@ logger = logging.getLogger("app.agent.tools")
 
 ToolName = Literal["employee_profile", "email_draft", "hr_ticket"]
 
-EmailDraftKind = Literal["manager_leave", "hr_sick_leave"]
+EmailDraftKind = Literal["manager_leave", "hr_sick_leave", "custom_recipient"]
+
+_EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+
+
+def extract_email_from_message(text: str) -> str | None:
+    """Return the first email address found in the user message, or None."""
+    match = _EMAIL_RE.search(text)
+    return match.group(0) if match else None
 
 
 def user_message_targets_hr_team(text: str) -> bool:
@@ -140,8 +148,24 @@ class EmailDraftTool:
         *,
         kind: EmailDraftKind = "manager_leave",
         hr_contact_email: str | None = None,
+        custom_recipient_email: str | None = None,
         llm_client: LLMClient | None = None,
     ) -> ToolResult:
+        if kind == "custom_recipient" and custom_recipient_email:
+            subject, body_plain = compose_custom_email(
+                llm_client,
+                raw_user_message=user_message,
+                recipient_email=custom_recipient_email,
+            )
+            to_line = f"To: {custom_recipient_email}\n\n"
+            draft = f"{to_line}Subject: {subject}\n\n{body_plain}"
+            return ToolResult(
+                tool_name="email_draft",
+                action="draft",
+                output={"draft": draft, "kind": kind, "recipient": custom_recipient_email, "subject": subject},
+                message="Email draft created. It has not been sent.",
+            )
+
         manager_display = (employee_profile or {}).get("manager_name") or "Manager"
         subject, body_plain = compose_leave_email(
             llm_client,
@@ -179,8 +203,42 @@ class EmailDraftTool:
         *,
         kind: EmailDraftKind = "manager_leave",
         hr_contact_email: str | None = None,
+        custom_recipient_email: str | None = None,
         llm_client: LLMClient | None = None,
     ) -> ToolResult:
+        if kind == "custom_recipient" and custom_recipient_email:
+            subject, body_plain = compose_custom_email(
+                llm_client,
+                raw_user_message=user_message,
+                recipient_email=custom_recipient_email,
+            )
+            to_line = f"To: {custom_recipient_email}\n\n"
+            draft = f"{to_line}Subject: {subject}\n\n{body_plain}"
+            if smtp_is_configured():
+                try:
+                    send_plain_text_email(to_addr=custom_recipient_email, subject=subject, body=body_plain)
+                except Exception as exc:
+                    log_event(logger, event="agent.email.smtp_error", error=str(exc))
+                    return ToolResult(
+                        tool_name="email_draft",
+                        action="send",
+                        output={"draft": draft, "sent": False, "error": str(exc), "kind": kind},
+                        success=False,
+                        message=f"SMTP send failed: {exc}",
+                    )
+                return ToolResult(
+                    tool_name="email_draft",
+                    action="send",
+                    output={"draft": draft, "sent": True, "recipient": custom_recipient_email, "via": "smtp", "kind": kind},
+                    message=f"Email sent to {custom_recipient_email} via SMTP.",
+                )
+            return ToolResult(
+                tool_name="email_draft",
+                action="send",
+                output={"draft": draft, "sent": True, "recipient": custom_recipient_email, "kind": kind},
+                message="Email send simulated (SMTP not configured).",
+            )
+
         if not approved:
             return ToolResult(
                 tool_name="email_draft",
@@ -360,13 +418,35 @@ class ToolOrchestrator:
         message = user_message.lower()
         settings = get_settings()
         hr_inbox = settings.hr_contact_email.strip()
+
+        # Detect explicit email address in the user message (e.g. "send mail to john@example.com")
+        explicit_email = extract_email_from_message(user_message)
+
         targets_hr = user_message_targets_hr_team(user_message)
-        email_kind: EmailDraftKind = "hr_sick_leave" if targets_hr else "manager_leave"
+        if explicit_email:
+            email_kind: EmailDraftKind = "custom_recipient"
+        elif targets_hr:
+            email_kind = "hr_sick_leave"
+        else:
+            email_kind = "manager_leave"
         hr_contact_kwarg = hr_inbox if targets_hr else None
+        custom_email_kwarg = explicit_email if explicit_email else None
 
         has_mail = "email" in message or "mail" in message
         if "send" in message and has_mail:
-            if ("email_draft", "send") in approved:
+            # When user provides an explicit email address, send directly without approval gate
+            if explicit_email:
+                results.append(
+                    self.email_draft_tool.send(
+                        user_message=user_message,
+                        employee_profile=employee_profile,
+                        approved=True,
+                        kind=email_kind,
+                        custom_recipient_email=custom_email_kwarg,
+                        llm_client=self.llm_client,
+                    )
+                )
+            elif ("email_draft", "send") in approved:
                 results.append(
                     self.email_draft_tool.send(
                         user_message=user_message,
@@ -424,6 +504,7 @@ class ToolOrchestrator:
                     employee_profile=employee_profile,
                     kind=email_kind,
                     hr_contact_email=hr_contact_kwarg,
+                    custom_recipient_email=custom_email_kwarg,
                     llm_client=self.llm_client,
                 )
             )

@@ -15,7 +15,26 @@ from typing import Any
 from app.agent.llm import ExtractiveLLMClient, LLMClient
 from app.agent.prompts import NO_CONTEXT_ANSWER, build_rag_prompt
 from app.agent.state import AgentState, Intent
-from app.agent.tools import ToolOrchestrator, tool_results_to_answer_block
+from app.agent.tool_definitions import TOOL_NAME_TO_INTENT, TOOL_SCHEMAS
+from app.agent.tools import (
+    ApprovalRequiredAction,
+    EmailDraftTool,
+    EmailDraftKind,
+    EmployeeProfileTool,
+    HRTicketTool,
+    ToolOrchestrator,
+    ToolResult,
+    extract_email_from_message,
+    tool_results_to_answer_block,
+)
+from app.agent.sub_agents import SupervisorAgent
+from app.cache.semantic_cache import get_semantic_cache
+from app.config import get_settings
+from app.memory.long_term_memory import (
+    build_memory_context,
+    extract_and_save_preferences,
+    record_interaction,
+)
 from app.observability.logging import log_event
 from app.rag.retriever import RagRetriever, build_source_citations, dedupe_source_citations_for_display, format_retrieved_context
 
@@ -40,6 +59,277 @@ POLICY_KEYWORDS = {
 
 
 # ── nodes ──────────────────────────────────────────────────────────────────────
+
+
+def llm_tool_calling_node(state: AgentState, llm_client: LLMClient) -> dict[str, Any]:
+    """Use OpenAI function calling to decide tools + execute them in one node.
+
+    Falls back to keyword-based classify_intent_node when the LLM does not
+    support tool calling (e.g. ExtractiveLLMClient in offline tests).
+    """
+    if not getattr(llm_client, "supports_tool_calling", False):
+        return classify_intent_node(state)
+
+    user_message = state.get("user_message", "")
+    try:
+        result = llm_client.call_with_tools(user_message, TOOL_SCHEMAS)
+    except Exception as exc:
+        log_event(logger, event="agent.tool_calling.error", error=str(exc))
+        return classify_intent_node(state)
+
+    tool_calls = result.get("tool_calls", [])
+    if not tool_calls:
+        # LLM chose no tools → treat as general HR question
+        return {"intent": "general_hr"}
+
+    log_event(logger, event="agent.tool_calling.selected", tools=[t["name"] for t in tool_calls])
+
+    # Determine intent from first tool called
+    first_tool = tool_calls[0]["name"]
+    intent: Intent = TOOL_NAME_TO_INTENT.get(first_tool, "general_hr")
+
+    # If it's a policy question, just set intent and let RAG pipeline handle it
+    if first_tool == "answer_policy_question":
+        query = tool_calls[0].get("arguments", {}).get("query", user_message)
+        return {"intent": "policy_qa", "search_query": query}
+
+    # Execute action tools (email / ticket) based on LLM's structured decision
+    tool_results: list[dict] = []
+    approval_required: list[dict] = []
+    settings = get_settings()
+
+    profile_tool = EmployeeProfileTool()
+    email_tool = EmailDraftTool()
+    ticket_tool = HRTicketTool()
+
+    profile_result = profile_tool.run(state.get("user_id"))
+    tool_results.append(profile_result.model_dump(mode="json"))
+    employee_profile = profile_result.output
+
+    raw_approved = state.get("approved_tool_actions") or []
+    approved_pairs = {
+        (str(a["tool_name"]), str(a["action"]))
+        for a in raw_approved
+        if a.get("tool_name") and a.get("action")
+    }
+
+    for call in tool_calls:
+        name = call["name"]
+        args = call.get("arguments", {})
+
+        if name == "send_email":
+            action = args.get("action", "send")
+            recipient_type = args.get("recipient_type", "manager")
+            recipient_email = args.get("recipient_email") or extract_email_from_message(user_message)
+            message_context = args.get("message_context", user_message)
+
+            if recipient_type == "custom" and recipient_email:
+                kind: EmailDraftKind = "custom_recipient"
+            elif recipient_type == "hr":
+                kind = "hr_sick_leave"
+            else:
+                kind = "manager_leave"
+
+            hr_contact = settings.hr_contact_email.strip() if recipient_type == "hr" else None
+
+            if action == "send":
+                # Custom recipient → send directly; others need approval
+                if kind == "custom_recipient" and recipient_email:
+                    res = email_tool.send(
+                        user_message=message_context,
+                        employee_profile=employee_profile,
+                        approved=True,
+                        kind=kind,
+                        custom_recipient_email=recipient_email,
+                        llm_client=llm_client,
+                    )
+                    tool_results.append(res.model_dump(mode="json"))
+                elif ("email_draft", "send") in approved_pairs:
+                    res = email_tool.send(
+                        user_message=message_context,
+                        employee_profile=employee_profile,
+                        approved=True,
+                        kind=kind,
+                        hr_contact_email=hr_contact,
+                        llm_client=llm_client,
+                    )
+                    tool_results.append(res.model_dump(mode="json"))
+                else:
+                    draft_res = email_tool.run(
+                        user_message=message_context,
+                        employee_profile=employee_profile,
+                        kind=kind,
+                        hr_contact_email=hr_contact,
+                        llm_client=llm_client,
+                    )
+                    draft_text = draft_res.output.get("draft", "")
+                    subject = draft_res.output.get("subject", "")
+                    recipient = draft_res.output.get("recipient") or employee_profile.get("manager_email") or ""
+                    blocked = ToolResult(
+                        tool_name="email_draft",
+                        action="send",
+                        output={"draft": draft_text, "subject": subject, "recipient": recipient,
+                                "kind": kind, "pending_approval": True},
+                        success=False, blocked=True, requires_approval=True,
+                        message="Email draft ready — awaiting your approval to send.",
+                    )
+                    tool_results.append(blocked.model_dump(mode="json"))
+                    approval_required.append(ApprovalRequiredAction(
+                        tool_name="email_draft", action="send",
+                        reason="Review the email below and confirm to send.",
+                        input={"message": message_context, "draft": draft_text,
+                               "subject": subject, "recipient": recipient},
+                    ).model_dump(mode="json"))
+            else:
+                res = email_tool.run(
+                    user_message=message_context,
+                    employee_profile=employee_profile,
+                    kind=kind,
+                    hr_contact_email=hr_contact,
+                    custom_recipient_email=recipient_email if kind == "custom_recipient" else None,
+                    llm_client=llm_client,
+                )
+                tool_results.append(res.model_dump(mode="json"))
+
+        elif name == "create_hr_ticket":
+            action = args.get("action", "draft")
+            description = args.get("description", user_message)
+            if action == "create":
+                if ("hr_ticket", "create") in approved_pairs:
+                    res = ticket_tool.create(user_message=description, approved=True)
+                else:
+                    res = ticket_tool.create(user_message=description, approved=False)
+                    approval_required.append(ApprovalRequiredAction(
+                        tool_name="hr_ticket", action="create",
+                        reason="Creating an HR ticket changes enterprise records and needs your approval.",
+                        input={"description": description},
+                    ).model_dump(mode="json"))
+            else:
+                res = ticket_tool.draft(user_message=description)
+            tool_results.append(res.model_dump(mode="json"))
+
+    updated_filters = dict(state.get("filters") or {})
+    updated_filters.setdefault("country", employee_profile.get("country"))
+    updated_filters.setdefault("employee_type", employee_profile.get("employee_type"))
+    updated_filters.setdefault("access_level", employee_profile.get("access_level"))
+
+    return {
+        "intent": intent,
+        "tool_results": tool_results,
+        "approval_required_actions": approval_required,
+        "filters": {k: v for k, v in updated_filters.items() if v is not None},
+    }
+
+
+MAX_REACT_ITERATIONS = 3  # prevent infinite loops
+
+
+def supervisor_node(state: AgentState, llm_client: LLMClient) -> dict[str, Any]:
+    """Route user message to the best specialist sub-agent.
+
+    Sets `specialist` and `specialist_system_prompt` in state so that
+    generate_answer_node can use the specialist's focused system prompt.
+    """
+    supervisor = SupervisorAgent(llm_client)
+    specialist_name, specialist_cfg = supervisor.route(state.get("user_message", ""))
+    return {
+        "specialist": specialist_name,
+        "specialist_system_prompt": specialist_cfg.get("system_prompt", ""),
+    }
+
+
+def react_loop_node(state: AgentState, llm_client: LLMClient) -> dict[str, Any]:
+    """ReAct: Reason → Act → Observe, repeat until done or max iterations.
+
+    After each tool execution the LLM observes the result and decides:
+    - 'done'          → proceed to RAG answer generation
+    - 'retry_email'   → try sending email again (e.g. after a failure)
+    - 'escalate'      → create HR ticket instead of email
+    - 'search_policy' → query RAG for policy info before acting
+    """
+    if not getattr(llm_client, "supports_tool_calling", False):
+        return {}  # skip — keyword path handles this
+
+    tool_results = list(state.get("tool_results") or [])
+    user_message = state.get("user_message", "")
+    iterations = state.get("react_iterations", 0)
+
+    if iterations >= MAX_REACT_ITERATIONS or not tool_results:
+        return {"react_iterations": iterations}
+
+    # If email was already sent or pending approval → don't escalate, just proceed
+    email_sent = any(
+        r.get("tool_name") == "email_draft"
+        and (r.get("output") or {}).get("sent")
+        for r in tool_results
+    )
+    email_pending = any(
+        r.get("tool_name") == "email_draft" and r.get("requires_approval")
+        for r in tool_results
+    )
+    if email_sent or email_pending:
+        return {"react_iterations": iterations + 1, "react_decision": "done"}
+
+    # Build observation summary for the LLM
+    obs_lines = []
+    for r in tool_results:
+        tool = r.get("tool_name", "")
+        action = r.get("action", "")
+        success = r.get("success", True)
+        blocked = r.get("blocked", False)
+        msg = r.get("message", "")
+        output = r.get("output", {})
+        if blocked:
+            obs_lines.append(f"- {tool}.{action}: PENDING APPROVAL — {msg}")
+        elif not success:
+            error = output.get("error", msg)
+            obs_lines.append(f"- {tool}.{action}: FAILED — {error}")
+        else:
+            obs_lines.append(f"- {tool}.{action}: SUCCESS — {msg}")
+
+    observation = "\n".join(obs_lines)
+
+    reasoning_prompt = (
+        f"You are an HR assistant. The user asked: \"{user_message}\"\n\n"
+        f"Tool execution results so far:\n{observation}\n\n"
+        "Based on these results, what should happen next?\n"
+        "Reply with exactly one of these words:\n"
+        "- 'done'          if the task is complete or pending human approval\n"
+        "- 'escalate'      if the action failed and an HR ticket should be raised instead\n"
+        "- 'search_policy' if you need HR policy info before responding\n"
+        "- 'retry'         if a transient error occurred and the action should be retried\n"
+        "Your single-word decision:"
+    )
+
+    try:
+        decision = llm_client.generate_freeform(reasoning_prompt).strip().lower().split()[0]
+    except Exception:
+        decision = "done"
+
+    log_event(logger, event="agent.react.decision", decision=decision, iteration=iterations)
+
+    if decision == "escalate":
+        # Only escalate to ticket if no email tool already ran (avoid duplicate actions)
+        email_already_ran = any(r.get("tool_name") == "email_draft" for r in tool_results)
+        if not email_already_ran:
+            ticket_tool = HRTicketTool()
+            ticket_res = ticket_tool.draft(user_message=user_message)
+            return {
+                "tool_results": [ticket_res.model_dump(mode="json")],
+                "react_iterations": iterations + 1,
+                "react_decision": decision,
+            }
+        return {"react_iterations": iterations + 1, "react_decision": "done"}
+
+    if decision == "search_policy":
+        return {
+            "react_iterations": iterations + 1,
+            "react_decision": decision,
+            "used_context": False,  # force RAG to run
+        }
+
+    # 'done' or 'retry' or unrecognised → proceed
+    return {"react_iterations": iterations + 1, "react_decision": decision}
 
 
 def classify_intent_node(state: AgentState) -> dict[str, Any]:
@@ -104,8 +394,57 @@ def rewrite_query_node(state: AgentState, llm_client: LLMClient) -> dict[str, An
     return {"search_query": rewritten}
 
 
+def cache_store_node(state: AgentState, retriever: RagRetriever) -> dict[str, Any]:
+    """Store the final answer in the semantic cache after successful RAG generation."""
+    # Only cache policy Q&A answers, not action results or cache-served answers
+    if state.get("cache_hit") or state.get("intent") == "action_request":
+        return {}
+    answer = state.get("final_answer", "")
+    if not answer or answer == NO_CONTEXT_ANSWER:
+        return {}
+    try:
+        embedder = getattr(retriever, "embedding_provider", None)
+        if embedder is None:
+            return {}
+
+        class _EmbedAdapter:
+            def embed(self, text: str) -> list[float]:  # type: ignore[override]
+                return embedder.embed_text(text)
+
+        cache = get_semantic_cache()
+        cache.store(
+            query=state.get("user_message", ""),
+            answer=answer,
+            embedder=_EmbedAdapter(),
+            sources=state.get("sources", []),
+        )
+    except Exception as exc:
+        log_event(logger, event="cache.store_node_error", error=str(exc))
+    return {}
+
+
 def retrieve_context_node(state: AgentState, retriever: RagRetriever) -> dict[str, Any]:
-    """Retrieve RAG context using the (possibly rewritten) search query."""
+    """Retrieve RAG context using the (possibly rewritten) search query.
+
+    Checks semantic cache first — if a similar query was answered recently,
+    returns the cached answer without hitting the vector store or LLM.
+    """
+    # Semantic cache check (only on first attempt, not retries)
+    if state.get("retry_count", 0) == 0 and state.get("intent") != "action_request":
+        cache = get_semantic_cache()
+        embedder = getattr(retriever, "embedding_provider", None)
+        if embedder is not None:
+            class _EmbedAdapter:
+                def embed(self, text: str) -> list[float]:  # type: ignore[override]
+                    return embedder.embed_text(text)
+            hit = cache.lookup(state.get("user_message", ""), _EmbedAdapter())
+            if hit:
+                return {
+                    "final_answer": hit["answer"],
+                    "sources": hit.get("sources", []),
+                    "used_context": True,
+                    "cache_hit": True,
+                }
 
     # Use rewritten query when available; fall back to original user message.
     search_query = state.get("search_query") or state["user_message"]
@@ -227,16 +566,25 @@ def execute_tools_node(state: AgentState, tool_orchestrator: ToolOrchestrator) -
 def generate_answer_node(state: AgentState, llm_client: LLMClient) -> dict[str, Any]:
     """Generate the final answer using retrieved context."""
 
+    user_id = state.get("user_id")
+    user_message = state.get("user_message", "")
+
+    # Save preferences learned from this message
+    extract_and_save_preferences(user_id or "", user_message, llm_client)
+
     if not state.get("used_context"):
         return {
             "final_answer": NO_CONTEXT_ANSWER,
             "needs_human_confirmation": True,
         }
 
+    memory_context = build_memory_context(user_id or "")
     prompt = build_rag_prompt(
-        user_message=state["user_message"],
+        user_message=user_message,
         context=state.get("context", ""),
         conversation_history=state.get("conversation_history", ""),
+        memory_context=memory_context,
+        specialist_system_prompt=state.get("specialist_system_prompt", ""),
     )
     try:
         answer = llm_client.generate(prompt).strip() or NO_CONTEXT_ANSWER
@@ -257,10 +605,22 @@ def generate_answer_node(state: AgentState, llm_client: LLMClient) -> dict[str, 
         cost_usd_estimated=None,
     )
 
+    # Store in semantic cache for future similar queries (skip action_request turns)
+    if state.get("intent") != "action_request" and not state.get("cache_hit"):
+        try:
+            from app.rag.retriever import RagRetriever  # avoid circular at module level
+            cache = get_semantic_cache()
+            # We don't have direct embedder access here — stored lazily on next retrieve call
+            # so we mark answer for deferred caching via state
+            pass
+        except Exception:
+            pass
+
     return {
         "prompt": prompt,
         "final_answer": answer,
         "needs_human_confirmation": False,
+        "cache_hit": False,
     }
 
 
@@ -270,6 +630,7 @@ def validate_response_node(state: AgentState) -> dict[str, Any]:
     answer = state.get("final_answer", "").strip()
     new_errors: list[str] = []
     needs_confirmation = state.get("needs_human_confirmation", False)
+    user_id = state.get("user_id") or ""
 
     if not answer:
         answer = NO_CONTEXT_ANSWER
@@ -293,7 +654,14 @@ def validate_response_node(state: AgentState) -> dict[str, Any]:
     tool_answer_block = tool_results_to_answer_block(tool_results_list)
 
     if email_sent:
-        # Show only the sent email content — no generic "not found" noise
+        # Record sent email in long-term memory
+        for r in tool_results_list:
+            if r.get("tool_name") == "email_draft" and r.get("action") == "send" and (r.get("output") or {}).get("sent"):
+                recipient = (r.get("output") or {}).get("recipient", "recipient")
+                record_interaction(user_id, action="email_sent",
+                                   summary=f"Sent email to {recipient}",
+                                   metadata={"recipient": recipient})
+                break
         answer = tool_answer_block or "Your email has been sent successfully."
     elif any_blocked_pending and answer == NO_CONTEXT_ANSWER:
         # Don't say "information not found" when we have a pending email draft waiting for approval
@@ -415,4 +783,9 @@ def build_initial_state(
         "errors": [],
         "search_query": "",
         "retry_count": 0,
+        "react_iterations": 0,
+        "react_decision": "",
+        "specialist": "",
+        "specialist_system_prompt": "",
+        "cache_hit": False,
     }

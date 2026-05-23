@@ -12,6 +12,8 @@ from app.agent.prompts import NO_CONTEXT_ANSWER
 class LLMClient(ABC):
     """Abstract chat completion client."""
 
+    supports_tool_calling: bool = False
+
     @abstractmethod
     def generate(self, prompt: str) -> str:
         """Generate from RAG-shaped prompts (policy Q&A)."""
@@ -23,6 +25,14 @@ class LLMClient(ABC):
         RAG-shaped prompts should override this method.
         """
         return self.generate(prompt)
+
+    def call_with_tools(self, user_message: str, tools: list[dict]) -> dict:
+        """Call LLM with function-calling tools. Returns {tool_calls, text}.
+
+        Base implementation returns empty tool_calls so callers fall back to
+        keyword-based routing when the provider does not support tool calling.
+        """
+        return {"tool_calls": [], "text": ""}
 
     async def stream_generate(self, prompt: str) -> AsyncIterator[str]:
         """Stream tokens. Default: yield the full answer in one shot."""
@@ -73,11 +83,50 @@ class ExtractiveLLMClient(LLMClient):
 class OpenAIChatClient(LLMClient):
     """OpenAI chat client with lazy import."""
 
+    supports_tool_calling: bool = True
+
     def __init__(self, api_key: str, model: str) -> None:
         if not api_key:
             raise ValueError("OpenAI API key is required for OpenAIChatClient")
         self.api_key = api_key
         self.model = model
+
+    def call_with_tools(self, user_message: str, tools: list[dict]) -> dict:
+        """Use OpenAI function calling to let the LLM decide which tools to invoke."""
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise RuntimeError("openai package required") from exc
+
+        client = OpenAI(api_key=self.api_key)
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an HR assistant. Based on the user's request, "
+                        "call the appropriate tool(s). For email requests, always use "
+                        "send_email. For policy questions, use answer_policy_question. "
+                        "Extract the exact email address if mentioned by the user."
+                    ),
+                },
+                {"role": "user", "content": user_message},
+            ],
+            tools=tools,
+            tool_choice="auto",
+            temperature=0,
+        )
+        message = response.choices[0].message
+        tool_calls = []
+        for tc in message.tool_calls or []:
+            import json
+            try:
+                args = json.loads(tc.function.arguments)
+            except Exception:
+                args = {}
+            tool_calls.append({"name": tc.function.name, "arguments": args})
+        return {"tool_calls": tool_calls, "text": message.content or ""}
 
     def generate(self, prompt: str) -> str:
         try:

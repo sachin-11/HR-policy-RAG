@@ -181,7 +181,13 @@ async def chat(
             detail="Prompt injection detected in request text.",
         )
 
+    # Extract email BEFORE PII masking — user intentionally provides it for sending
+    from app.agent.tools import extract_email_from_message as _extract_email
+    _explicit_email = _extract_email(request.message)
     safe_message = mask_pii(request.message)
+    if _explicit_email:
+        safe_message = safe_message.replace("[EMAIL_REDACTED]", _explicit_email, 1)
+
     # Do not treat the placeholder "anonymous" user id as an account-scoped target; that
     # incorrectly triggers PermissionDenied for unauthenticated /chat calls.
     target_user_id = request.user_id

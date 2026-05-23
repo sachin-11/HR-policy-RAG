@@ -8,10 +8,54 @@ from typing import TYPE_CHECKING, Literal
 if TYPE_CHECKING:
     from app.agent.llm import LLMClient
 
-ComposeKind = Literal["manager_leave", "hr_sick_leave"]
+ComposeKind = Literal["manager_leave", "hr_sick_leave", "custom_recipient"]
 
 _NOTE_START = "BEGIN_EMPLOYEE_NOTE"
 _NOTE_END = "END_EMPLOYEE_NOTE"
+
+
+def build_custom_email_compose_prompt(
+    *,
+    raw_user_message: str,
+    recipient_email: str,
+) -> str:
+    return (
+        "You write concise workplace emails in English.\n\n"
+        f"The email is addressed to: {recipient_email}\n"
+        "Convert the user's message into a polite, professional email.\n"
+        "Do not include meta-instructions like 'send email to' — only the actual content.\n\n"
+        f"{_NOTE_START}\n{raw_user_message.strip()}\n{_NOTE_END}\n\n"
+        "Respond in exactly this format (no markdown fences):\n"
+        "SUBJECT: <short subject line>\n\n"
+        "BODY:\n"
+        "<email body only: greeting line, 2–5 sentences, closing line Regards>\n"
+    )
+
+
+def compose_custom_email(
+    llm_client: "LLMClient | None",
+    *,
+    raw_user_message: str,
+    recipient_email: str,
+) -> tuple[str, str]:
+    """Compose a generic professional email to a custom recipient."""
+    if llm_client is not None:
+        prompt = build_custom_email_compose_prompt(
+            raw_user_message=raw_user_message,
+            recipient_email=recipient_email,
+        )
+        try:
+            raw = llm_client.generate_freeform(prompt)
+            parsed_subject, parsed_body = parse_subject_and_body(raw)
+            if parsed_subject and parsed_body:
+                return parsed_subject.strip(), parsed_body.strip()
+        except Exception:
+            pass
+
+    # Fallback: use message as-is
+    subject = "Message from employee"
+    body = f"Hi,\n\n{raw_user_message.strip()}\n\nRegards"
+    return subject, body
 
 
 def build_email_compose_prompt(

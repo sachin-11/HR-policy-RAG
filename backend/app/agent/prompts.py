@@ -24,12 +24,20 @@ in your answer when they match the question.
 """
 
 
-def build_rag_prompt(user_message: str, context: str, conversation_history: str = "") -> str:
-    """Build the final prompt for a RAG answer, optionally including prior-turn history."""
+def build_rag_prompt(
+    user_message: str,
+    context: str,
+    conversation_history: str = "",
+    memory_context: str = "",
+    specialist_system_prompt: str = "",
+) -> str:
+    """Build the final RAG prompt, injecting specialist role, memory, and history."""
 
+    system = specialist_system_prompt.strip() if specialist_system_prompt.strip() else RAG_SYSTEM_PROMPT
     history_block = f"\n{conversation_history}\n" if conversation_history.strip() else ""
-    return f"""{RAG_SYSTEM_PROMPT}
-{history_block}
+    memory_block = f"\nUser context (from memory):\n{memory_context}\n" if memory_context.strip() else ""
+    return f"""{system}
+{history_block}{memory_block}
 Approved HR policy context:
 {context}
 
