@@ -168,3 +168,36 @@ def test_delete_session_not_found(client):
 def test_versioned_session_route(client, seeded_session):
     resp = client.get(f"/api/v1/sessions/{seeded_session}")
     assert resp.status_code == 200
+
+
+def test_get_all_sessions_store():
+    store = SessionStore()
+    s1 = store.create_session()
+    time.sleep(0.001)
+    s2 = store.create_session()
+    
+    sessions = store.get_all_sessions()
+    assert len(sessions) == 2
+    # Should be sorted descending by updated_at, so s2 first
+    assert sessions[0].session_id == s2.session_id
+    assert sessions[1].session_id == s1.session_id
+
+
+def test_list_sessions_route(client):
+    # Clear store first to get predictable results
+    store = get_session_store()
+    with store._lock:
+        store._sessions.clear()
+        
+    s1 = store.create_session()
+    store.add_turn(s1.session_id, "What is the policy for leave?", "Details here.")
+    
+    resp = client.get("/sessions")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "sessions" in data
+    assert len(data["sessions"]) == 1
+    assert data["sessions"][0]["session_id"] == s1.session_id
+    assert data["sessions"][0]["title"] == "What is the policy for leave?"
+    assert data["sessions"][0]["message_count"] == 2
+

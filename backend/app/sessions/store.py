@@ -111,6 +111,20 @@ class SessionStore:
         with self._lock:
             return self._sessions.pop(session_id, None) is not None
 
+    def get_all_sessions(self) -> list[ConversationSession]:
+        """Return all active (non-expired) sessions sorted by updated_at descending."""
+        with self._lock:
+            # Purge expired first to ensure we only return active ones
+            expired = [sid for sid, s in self._sessions.items() if s.is_expired()]
+            for sid in expired:
+                del self._sessions[sid]
+            
+            return sorted(
+                self._sessions.values(),
+                key=lambda s: s.updated_at,
+                reverse=True,
+            )
+
     def purge_expired(self) -> int:
         """Remove all expired sessions. Returns count removed."""
         with self._lock:

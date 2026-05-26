@@ -35,6 +35,53 @@ class SessionClearedResponse(BaseModel):
     cleared: bool
 
 
+class SessionInfo(BaseModel):
+    """Metadata/summary of a conversation session for the sidebar."""
+
+    session_id: str
+    updated_at: datetime
+    message_count: int
+    title: str
+
+
+class SessionListResponse(BaseModel):
+    """List of all active conversation sessions."""
+
+    sessions: list[SessionInfo]
+
+
+def get_session_title(messages: list[ConversationMessage]) -> str:
+    """Helper to extract a title from the first user message."""
+    for msg in messages:
+        if msg.role == "user":
+            content = msg.content.strip()
+            if len(content) > 30:
+                return content[:27] + "..."
+            return content
+    return "New Chat"
+
+
+@router.get("/sessions", response_model=SessionListResponse)
+async def list_sessions() -> SessionListResponse:
+    """Return all active conversation sessions sorted by updated_at descending."""
+    store = get_session_store()
+    sessions = store.get_all_sessions()
+    
+    session_infos = []
+    for s in sessions:
+        title = get_session_title(s.messages)
+        session_infos.append(
+            SessionInfo(
+                session_id=s.session_id,
+                updated_at=s.updated_at,
+                message_count=len(s.messages),
+                title=title,
+            )
+        )
+    return SessionListResponse(sessions=session_infos)
+
+
+
 @router.get("/sessions/{session_id}", response_model=SessionHistoryResponse)
 async def get_session_history(session_id: str) -> SessionHistoryResponse:
     """Return the full conversation history for the given session ID."""
